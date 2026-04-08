@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict
 from pathlib import Path
 
@@ -31,6 +32,24 @@ CANONICAL_ARROW_SCHEMA = pa.schema(
 
 def load_recipe(path: str) -> dict[str, object]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    slug = re.sub(r"-{2,}", "-", slug)
+    return slug or "asr-dataset"
+
+
+def build_repo_slug(recipe: dict[str, object], recipe_path: str | None = None) -> str:
+    if recipe_path:
+        stem = Path(recipe_path).stem
+        if stem:
+            return slugify(stem)
+    dataset_keys = [item.get("dataset_key", "") for item in recipe.get("selected_datasets", [])]
+    if dataset_keys:
+        base = "-".join(dataset_keys[:3])
+        return slugify(f"{base}-dataset")
+    return "asr-dataset"
 
 
 def parse_key_value_pairs(items: list[str], cast=str) -> dict[str, object]:
@@ -170,11 +189,13 @@ def write_materialization_manifest(
     out_dir: str,
     recipe: dict[str, object],
     split_summaries: list[MaterializedSplitSummary],
+    suggested_repo_slug: str,
 ) -> str:
     manifest_path = Path(out_dir) / "materialization_manifest.json"
     payload = {
         "manifest_type": "materialized_asr_dataset",
         "canonical_schema": list(CANONICAL_COLUMNS),
+        "suggested_repo_slug": suggested_repo_slug,
         "recipe": recipe,
         "splits": [asdict(summary) for summary in split_summaries if summary.rows > 0],
     }
@@ -184,7 +205,8 @@ def write_materialization_manifest(
 
 def push_materialized_dataset(
     materialized_dir: str,
-    repo_id: str,
+    owner: str,
+    slug: str | None,
     private: bool,
     token: str | None,
     max_shard_size: str,
@@ -193,6 +215,10 @@ def push_materialized_dataset(
     progress = progress or NullProgressReporter()
     manifest_path = Path(materialized_dir) / "materialization_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    resolved_slug = slug or manifest.get("suggested_repo_slug")
+    if not resolved_slug:
+        raise ValueError("Unable to determine dataset slug. Provide --slug explicitly.")
+    repo_id = f"{owner}/{resolved_slug}"
     split_files: dict[str, str] = {}
     format_name = None
     for split in manifest.get("splits", []):

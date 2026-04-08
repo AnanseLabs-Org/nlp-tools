@@ -9,6 +9,7 @@ from asr_recipe.hf import HfMetadataClient
 from asr_recipe.materialize import (
     SplitWriter,
     assign_split,
+    build_repo_slug,
     build_text_filter_configs,
     index_filter_configs,
     load_recipe,
@@ -161,25 +162,29 @@ class RecipeService:
                         writer.write(records)
 
         split_summaries = [writers[split].close() for split in sorted(writers)]
-        manifest_path = write_materialization_manifest(out_dir, recipe, split_summaries)
+        suggested_repo_slug = build_repo_slug(recipe, recipe_path=recipe_path)
+        manifest_path = write_materialization_manifest(out_dir, recipe, split_summaries, suggested_repo_slug)
         self.progress.emit(f"Wrote materialized dataset: {manifest_path}")
         return {
             "out_dir": out_dir,
             "manifest_path": manifest_path,
+            "suggested_repo_slug": suggested_repo_slug,
             "splits": [asdict(summary) for summary in split_summaries if summary.rows > 0],
         }
 
     def push_dataset(
         self,
         materialized_dir: str,
-        repo_id: str,
+        owner: str,
+        slug: str | None,
         private: bool,
         token: str | None,
         max_shard_size: str,
     ) -> dict[str, object]:
         return push_materialized_dataset(
             materialized_dir=materialized_dir,
-            repo_id=repo_id,
+            owner=owner,
+            slug=slug,
             private=private,
             token=token,
             max_shard_size=max_shard_size,

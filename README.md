@@ -75,7 +75,16 @@ Push a materialized dataset to Hugging Face Hub:
 ```bash
 asr-recipe push-dataset \
   --materialized-dir output/materialized \
-  --repo-id AnanseLabs-Org/whisper-110h-recipe
+  --owner AnanseLabs-Org
+```
+
+Override the derived slug if you want your own dataset name:
+
+```bash
+asr-recipe push-dataset \
+  --materialized-dir output/materialized \
+  --owner AnanseLabs-Org \
+  --slug whisper-110h-recipe
 ```
 
 The v1 CLI does not decode audio and does not export a processed dataset. Its main artifact is the JSON recipe manifest.
@@ -136,7 +145,16 @@ Push the materialized dataset to Hugging Face Hub:
 ```python
 !asr-recipe push-dataset \
   --materialized-dir /content/materialized_dataset \
-  --repo-id your-org/your-materialized-asr-dataset
+  --owner your-org
+```
+
+Provide your own slug if needed:
+
+```python
+!asr-recipe push-dataset \
+  --materialized-dir /content/materialized_dataset \
+  --owner your-org \
+  --slug your-materialized-asr-dataset
 ```
 
 ## Push Checklist

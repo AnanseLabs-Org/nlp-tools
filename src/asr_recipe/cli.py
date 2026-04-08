@@ -151,7 +151,8 @@ def materialize_dataset_command(
 @app.command("push-dataset")
 def push_dataset_command(
     materialized_dir: Path = typer.Option(..., help="Directory created by materialize-dataset."),
-    repo_id: str = typer.Option(..., help="Target Hugging Face dataset repo id, for example org/name."),
+    owner: str = typer.Option(..., help="Target Hugging Face username or organization."),
+    slug: str | None = typer.Option(None, help="Optional dataset slug override. Defaults to the slug derived from the recipe."),
     private: bool = typer.Option(False, help="Create or update the remote dataset as private."),
     token: str | None = typer.Option(None, help="Optional Hugging Face token. Falls back to existing login."),
     max_shard_size: str = typer.Option("5GB", help="Shard size passed to datasets.push_to_hub()."),
@@ -161,7 +162,8 @@ def push_dataset_command(
     service = _service(quiet)
     payload = service.push_dataset(
         materialized_dir=str(materialized_dir),
-        repo_id=repo_id,
+        owner=owner,
+        slug=slug,
         private=private,
         token=token,
         max_shard_size=max_shard_size,
