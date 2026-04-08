@@ -18,6 +18,7 @@ NON_AUDIO_REQUIRED_COLUMNS = {
     "duration_ss",
     "text",
 }
+SOURCE_AUDIO_COLUMN = "audio"
 
 
 @dataclass
@@ -83,7 +84,28 @@ class DatasetAdapter:
                 if batch:
                     yield batch
 
-    def required_source_columns(self) -> list[str]:
+    def iter_materialization_batches(
+        self,
+        split: str,
+        batch_size: int = 1000,
+        include_audio: bool = False,
+    ) -> Iterator[list[tuple[CanonicalRecord, dict[str, object]]]]:
+        row_offsets: dict[str, int] = {}
+        columns = self.required_source_columns(include_audio=include_audio)
+        for shard in self.unique_shards(split):
+            for source_path, rows in self.reader.iter_batches(shard.path, columns=columns, batch_size=batch_size):
+                offset = row_offsets.get(source_path, 0)
+                batch: list[tuple[CanonicalRecord, dict[str, object]]] = []
+                for row in rows:
+                    record = self._to_canonical_record(split=split, shard_path=source_path, row=row, row_index=offset)
+                    materialized_row = self._materialized_row(record, row if include_audio else None)
+                    batch.append((record, materialized_row))
+                    offset += 1
+                row_offsets[source_path] = offset
+                if batch:
+                    yield batch
+
+    def required_source_columns(self, include_audio: bool = False) -> list[str]:
         requested = {
             self.spec.text_column,
             self.spec.duration_column,
@@ -92,7 +114,10 @@ class DatasetAdapter:
             self.spec.gender_column,
             self.spec.language_column,
         }
-        return sorted(column for column in requested if column and column in NON_AUDIO_REQUIRED_COLUMNS)
+        columns = sorted(column for column in requested if column and column in NON_AUDIO_REQUIRED_COLUMNS)
+        if include_audio and "audio" in self.metadata.features:
+            columns.append(SOURCE_AUDIO_COLUMN)
+        return columns
 
     def canonical_mapping(self) -> dict[str, str | None]:
         return {
@@ -150,6 +175,34 @@ class DatasetAdapter:
         seed = f"{self.spec.key}|{shard_path}|{row_index}"
         digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
         return f"derived:{digest}"
+
+    def _materialized_row(self, record: CanonicalRecord, source_row: dict[str, object] | None) -> dict[str, object]:
+        payload = {
+            "source_dataset": record.source_dataset,
+            "source_subset": record.source_subset,
+            "source_split": record.source_split,
+            "dataset_key": record.dataset_key,
+            "record_id": record.record_id,
+            "speaker_id": record.speaker_id,
+            "gender": record.gender,
+            "language": record.language,
+            "text": record.text,
+            "duration_seconds": record.duration_seconds,
+        }
+        if source_row and SOURCE_AUDIO_COLUMN in source_row:
+            payload["audio"] = self._normalize_audio_value(source_row.get(SOURCE_AUDIO_COLUMN))
+        return payload
+
+    @staticmethod
+    def _normalize_audio_value(value: object) -> dict[str, object] | None:
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            return {
+                "bytes": value.get("bytes"),
+                "path": value.get("path"),
+            }
+        return {"bytes": None, "path": str(value)}
 
     @staticmethod
     def _optional_str(value: object) -> str | None:

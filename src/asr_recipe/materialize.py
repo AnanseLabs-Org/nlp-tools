@@ -29,6 +29,21 @@ CANONICAL_ARROW_SCHEMA = pa.schema(
     ]
 )
 
+AUDIO_AWARE_ARROW_SCHEMA = pa.schema(
+    list(CANONICAL_ARROW_SCHEMA)
+    + [
+        pa.field(
+            "audio",
+            pa.struct(
+                [
+                    pa.field("bytes", pa.binary()),
+                    pa.field("path", pa.string()),
+                ]
+            ),
+        )
+    ]
+)
+
 
 def load_recipe(path: str) -> dict[str, object]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
@@ -141,48 +156,86 @@ def assign_split(record: CanonicalRecord, split_strategy: dict[str, object]) -> 
 
 
 class SplitWriter:
-    def __init__(self, split: str, out_dir: Path, output_format: str) -> None:
+    def __init__(
+        self,
+        split: str,
+        out_dir: Path,
+        output_format: str,
+        include_audio: bool = False,
+        max_rows_per_file: int = 100_000,
+    ) -> None:
         self.split = split
         self.out_dir = out_dir
         self.output_format = output_format
-        self.parquet_path = out_dir / split / "data.parquet"
-        self.arrow_path = out_dir / split / "data.arrow"
+        self.include_audio = include_audio
+        self.max_rows_per_file = max_rows_per_file
+        self.parquet_path: Path | None = None
+        self.arrow_path: Path | None = None
         self._parquet_writer: pq.ParquetWriter | None = None
         self._arrow_writer: ipc.RecordBatchFileWriter | None = None
         self.rows = 0
         self.duration_seconds = 0.0
+        self.schema = AUDIO_AWARE_ARROW_SCHEMA if include_audio else CANONICAL_ARROW_SCHEMA
+        self.parquet_files: list[str] = []
+        self.arrow_files: list[str] = []
+        self._rows_in_current_file = 0
+        self._file_index = 0
 
-    def write(self, records: list[CanonicalRecord]) -> None:
-        if not records:
-            return
-        rows = [asdict(record) for record in records]
-        table = pa.Table.from_pylist(rows, schema=CANONICAL_ARROW_SCHEMA)
-        target_dir = self.out_dir / self.split
-        target_dir.mkdir(parents=True, exist_ok=True)
-        if self.output_format in {"parquet", "both"}:
-            if self._parquet_writer is None:
-                self._parquet_writer = pq.ParquetWriter(str(self.parquet_path), CANONICAL_ARROW_SCHEMA)
-            self._parquet_writer.write_table(table)
-        if self.output_format in {"arrow", "both"}:
-            if self._arrow_writer is None:
-                sink = pa.OSFile(str(self.arrow_path), "wb")
-                self._arrow_writer = ipc.new_file(sink, CANONICAL_ARROW_SCHEMA)
-            self._arrow_writer.write_table(table)
-        self.rows += len(records)
-        self.duration_seconds += sum(record.duration_seconds or 0.0 for record in records)
+    def write(self, rows: list[dict[str, object]]) -> None:
+        start = 0
+        while start < len(rows):
+            if self._parquet_writer is None and self._arrow_writer is None:
+                self._open_new_file()
+            available = self.max_rows_per_file - self._rows_in_current_file
+            chunk = rows[start : start + available]
+            table = pa.Table.from_pylist(chunk, schema=self.schema)
+            if self._parquet_writer is not None:
+                self._parquet_writer.write_table(table)
+            if self._arrow_writer is not None:
+                self._arrow_writer.write_table(table)
+            self.rows += len(chunk)
+            self._rows_in_current_file += len(chunk)
+            self.duration_seconds += sum((row.get("duration_seconds") or 0.0) for row in chunk)
+            start += len(chunk)
+            if self._rows_in_current_file >= self.max_rows_per_file:
+                self._close_current_file()
 
     def close(self) -> MaterializedSplitSummary:
-        if self._parquet_writer is not None:
-            self._parquet_writer.close()
-        if self._arrow_writer is not None:
-            self._arrow_writer.close()
+        self._close_current_file()
         return MaterializedSplitSummary(
             split=self.split,
             rows=self.rows,
             duration_seconds=self.duration_seconds,
-            parquet_path=str(self.parquet_path) if self.parquet_path.exists() else None,
-            arrow_path=str(self.arrow_path) if self.arrow_path.exists() else None,
+            duration_hours=round(self.duration_seconds / 3600.0, 6),
+            parquet_files=self.parquet_files,
+            arrow_files=self.arrow_files,
         )
+
+    def _open_new_file(self) -> None:
+        target_dir = self.out_dir / self.split
+        target_dir.mkdir(parents=True, exist_ok=True)
+        if self.output_format in {"parquet", "both"}:
+            self.parquet_path = target_dir / f"data-{self._file_index:05d}.parquet"
+            self._parquet_writer = pq.ParquetWriter(str(self.parquet_path), self.schema)
+            self.parquet_files.append(str(self.parquet_path))
+        if self.output_format in {"arrow", "both"}:
+            self.arrow_path = target_dir / f"data-{self._file_index:05d}.arrow"
+            sink = pa.OSFile(str(self.arrow_path), "wb")
+            self._arrow_writer = ipc.new_file(sink, self.schema)
+            self.arrow_files.append(str(self.arrow_path))
+        self._rows_in_current_file = 0
+        self._file_index += 1
+
+    def _close_current_file(self) -> None:
+        if self._parquet_writer is not None:
+            self._parquet_writer.close()
+            self._parquet_writer = None
+        if self._arrow_writer is not None:
+            self._arrow_writer.close()
+            self._arrow_writer = None
+        self.parquet_path = None
+        self.arrow_path = None
+        self._rows_in_current_file = 0
 
 
 def write_materialization_manifest(
@@ -190,13 +243,17 @@ def write_materialization_manifest(
     recipe: dict[str, object],
     split_summaries: list[MaterializedSplitSummary],
     suggested_repo_slug: str,
+    include_audio: bool,
 ) -> str:
     manifest_path = Path(out_dir) / "materialization_manifest.json"
     payload = {
         "manifest_type": "materialized_asr_dataset",
         "canonical_schema": list(CANONICAL_COLUMNS),
+        "audio_enabled": include_audio,
         "suggested_repo_slug": suggested_repo_slug,
         "recipe": recipe,
+        "total_duration_seconds": sum(summary.duration_seconds for summary in split_summaries),
+        "total_duration_hours": round(sum(summary.duration_seconds for summary in split_summaries) / 3600.0, 6),
         "splits": [asdict(summary) for summary in split_summaries if summary.rows > 0],
     }
     manifest_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -219,14 +276,14 @@ def push_materialized_dataset(
     if not resolved_slug:
         raise ValueError("Unable to determine dataset slug. Provide --slug explicitly.")
     repo_id = f"{owner}/{resolved_slug}"
-    split_files: dict[str, str] = {}
+    split_files: dict[str, list[str] | str] = {}
     format_name = None
     for split in manifest.get("splits", []):
-        if split.get("parquet_path"):
-            split_files[split["split"]] = split["parquet_path"]
+        if split.get("parquet_files"):
+            split_files[split["split"]] = split["parquet_files"]
             format_name = "parquet"
-        elif split.get("arrow_path"):
-            split_files[split["split"]] = split["arrow_path"]
+        elif split.get("arrow_files"):
+            split_files[split["split"]] = split["arrow_files"]
             format_name = "arrow"
     if not split_files or format_name is None:
         raise FileNotFoundError(f"No materialized dataset files found under {materialized_dir}")
@@ -235,6 +292,11 @@ def push_materialized_dataset(
 
     progress.emit(f"Loading local {format_name} dataset files for push")
     dataset_dict = load_dataset(format_name, data_files=split_files)
+    if manifest.get("audio_enabled") and "audio" in dataset_dict[next(iter(dataset_dict))].column_names:
+        from datasets import Audio
+
+        progress.emit("Casting audio column to Hugging Face Audio feature")
+        dataset_dict = dataset_dict.cast_column("audio", Audio(decode=False))
     progress.emit(f"Pushing dataset to Hugging Face Hub: {repo_id}")
     dataset_dict.push_to_hub(repo_id, private=private, token=token, max_shard_size=max_shard_size)
     return {

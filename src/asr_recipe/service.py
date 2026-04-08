@@ -117,7 +117,9 @@ class RecipeService:
         recipe_path: str,
         out_dir: str,
         output_format: str,
+        include_audio: bool,
         batch_size: int,
+        max_rows_per_file: int,
         top_tokens_files: list[str],
         top_k_tokens: int,
         min_overlap_ratio: float,
@@ -150,25 +152,43 @@ class RecipeService:
             filter_config = filter_configs.get(dataset_key)
             for source_split in selected_splits:
                 self.progress.emit(f"Scanning source split: {dataset_key}/{source_split}")
-                for batch in adapter.iter_canonical_record_batches(source_split, batch_size=batch_size):
-                    grouped: dict[str, list] = {}
-                    for record in batch:
+                for batch in adapter.iter_materialization_batches(source_split, batch_size=batch_size, include_audio=include_audio):
+                    grouped: dict[str, list[dict[str, object]]] = {}
+                    for record, materialized_row in batch:
                         if not record_passes_filters(record, filter_config):
                             continue
                         target_split = assign_split(record, recipe["split_strategy"])
-                        grouped.setdefault(target_split, []).append(record)
+                        grouped.setdefault(target_split, []).append(materialized_row)
                     for target_split, records in grouped.items():
-                        writer = writers.setdefault(target_split, SplitWriter(target_split, out_path, output_format))
+                        writer = writers.setdefault(
+                            target_split,
+                            SplitWriter(
+                                target_split,
+                                out_path,
+                                output_format,
+                                include_audio=include_audio,
+                                max_rows_per_file=max_rows_per_file,
+                            ),
+                        )
                         writer.write(records)
 
         split_summaries = [writers[split].close() for split in sorted(writers)]
         suggested_repo_slug = build_repo_slug(recipe, recipe_path=recipe_path)
-        manifest_path = write_materialization_manifest(out_dir, recipe, split_summaries, suggested_repo_slug)
+        manifest_path = write_materialization_manifest(
+            out_dir,
+            recipe,
+            split_summaries,
+            suggested_repo_slug,
+            include_audio=include_audio,
+        )
         self.progress.emit(f"Wrote materialized dataset: {manifest_path}")
         return {
             "out_dir": out_dir,
             "manifest_path": manifest_path,
+            "audio_enabled": include_audio,
             "suggested_repo_slug": suggested_repo_slug,
+            "total_duration_seconds": sum(summary.duration_seconds for summary in split_summaries),
+            "total_duration_hours": round(sum(summary.duration_seconds for summary in split_summaries) / 3600.0, 6),
             "splits": [asdict(summary) for summary in split_summaries if summary.rows > 0],
         }
 

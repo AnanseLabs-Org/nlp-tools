@@ -82,8 +82,9 @@ class MaterializedSplitSummary:
     split: str
     rows: int
     duration_seconds: float
-    parquet_path: str | None = None
-    arrow_path: str | None = None
+    duration_hours: float
+    parquet_files: list[str] = field(default_factory=list)
+    arrow_files: list[str] = field(default_factory=list)
 
 
 @dataclass

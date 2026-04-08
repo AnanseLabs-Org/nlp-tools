@@ -22,11 +22,13 @@ def test_push_materialized_dataset_uses_datasets_library(tmp_path, monkeypatch) 
                         "split": "train",
                         "rows": 1,
                         "duration_seconds": 0.0,
-                        "parquet_path": str(parquet_file),
-                        "arrow_path": None,
+                        "duration_hours": 0.0,
+                        "parquet_files": [str(parquet_file)],
+                        "arrow_files": [],
                     }
                 ],
                 "suggested_repo_slug": "derived-slug",
+                "audio_enabled": False,
             }
         ),
         encoding="utf-8",
@@ -79,11 +81,13 @@ def test_push_materialized_dataset_accepts_slug_override(tmp_path, monkeypatch) 
                         "split": "train",
                         "rows": 1,
                         "duration_seconds": 0.0,
-                        "parquet_path": str(parquet_file),
-                        "arrow_path": None,
+                        "duration_hours": 0.0,
+                        "parquet_files": [str(parquet_file)],
+                        "arrow_files": [],
                     }
                 ],
                 "suggested_repo_slug": "derived-slug",
+                "audio_enabled": False,
             }
         ),
         encoding="utf-8",
