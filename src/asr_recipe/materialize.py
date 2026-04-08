@@ -1,0 +1,219 @@
+from __future__ import annotations
+
+import json
+from dataclasses import asdict
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.ipc as ipc
+import pyarrow.parquet as pq
+
+from asr_recipe.models import CANONICAL_COLUMNS, CanonicalRecord, MaterializedSplitSummary
+from asr_recipe.progress import NullProgressReporter, ProgressReporter
+from asr_recipe.splits import deterministic_split
+
+
+CANONICAL_ARROW_SCHEMA = pa.schema(
+    [
+        pa.field("source_dataset", pa.string()),
+        pa.field("source_subset", pa.string()),
+        pa.field("source_split", pa.string()),
+        pa.field("dataset_key", pa.string()),
+        pa.field("record_id", pa.string()),
+        pa.field("speaker_id", pa.string()),
+        pa.field("gender", pa.string()),
+        pa.field("language", pa.string()),
+        pa.field("text", pa.string()),
+        pa.field("duration_seconds", pa.float64()),
+    ]
+)
+
+
+def load_recipe(path: str) -> dict[str, object]:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def parse_key_value_pairs(items: list[str], cast=str) -> dict[str, object]:
+    parsed: dict[str, object] = {}
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"Expected KEY=VALUE format, got '{item}'")
+        key, value = item.split("=", 1)
+        parsed[key] = cast(value)
+    return parsed
+
+
+def load_top_tokens(path: str, top_k: int) -> list[str]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    top_tokens = payload.get("result", {}).get("top_tokens", [])
+    return [token for token, _count in top_tokens[:top_k]]
+
+
+def build_text_filter_configs(
+    recipe: dict[str, object],
+    top_tokens_files: dict[str, str],
+    top_k_tokens: int,
+    min_overlap_ratio: float,
+    min_text_tokens: int,
+    max_text_tokens: int | None,
+) -> dict[str, dict[str, object]]:
+    configured: dict[str, dict[str, object]] = {}
+    for dataset_key, path in top_tokens_files.items():
+        configured[dataset_key] = {
+            "type": "text_frequency_overlap",
+            "dataset_key": dataset_key,
+            "top_tokens": load_top_tokens(path, top_k=top_k_tokens),
+            "min_overlap_ratio": min_overlap_ratio,
+            "min_text_tokens": min_text_tokens,
+            "max_text_tokens": max_text_tokens,
+        }
+
+    filters = recipe.setdefault("filters", {"status": "not_started", "pipeline": []})
+    pipeline = filters.setdefault("pipeline", [])
+    for config in configured.values():
+        pipeline.append(config)
+    if pipeline:
+        filters["status"] = "configured"
+    return configured
+
+
+def index_filter_configs(recipe: dict[str, object]) -> dict[str, dict[str, object]]:
+    filters = recipe.get("filters", {})
+    pipeline = filters.get("pipeline", []) if isinstance(filters, dict) else []
+    result: dict[str, dict[str, object]] = {}
+    for item in pipeline:
+        if item.get("type") == "text_frequency_overlap" and item.get("dataset_key"):
+            result[item["dataset_key"]] = item
+    return result
+
+
+def record_passes_filters(record: CanonicalRecord, filter_config: dict[str, object] | None) -> bool:
+    if filter_config is None:
+        return True
+    if not record.text:
+        return False
+    tokens = [token.lower() for token in record.text.split() if token.strip()]
+    if len(tokens) < int(filter_config.get("min_text_tokens", 1)):
+        return False
+    max_text_tokens = filter_config.get("max_text_tokens")
+    if max_text_tokens is not None and len(tokens) > int(max_text_tokens):
+        return False
+    vocabulary = set(filter_config.get("top_tokens", []))
+    if not vocabulary:
+        return True
+    overlap = sum(1 for token in tokens if token in vocabulary)
+    ratio = overlap / len(tokens) if tokens else 0.0
+    return ratio >= float(filter_config.get("min_overlap_ratio", 0.0))
+
+
+def assign_split(record: CanonicalRecord, split_strategy: dict[str, object]) -> str:
+    policy = split_strategy.get("policy", "preserve")
+    if policy == "preserve":
+        return record.source_split
+    if policy == "train-val":
+        return deterministic_split(record.record_id, val_ratio=float(split_strategy.get("val_ratio", 0.1)))
+    if policy == "train-val-test":
+        return deterministic_split(
+            record.record_id,
+            val_ratio=float(split_strategy.get("val_ratio", 0.1)),
+            test_ratio=float(split_strategy.get("test_ratio", 0.1)),
+        )
+    raise ValueError(f"Unsupported split policy '{policy}'")
+
+
+class SplitWriter:
+    def __init__(self, split: str, out_dir: Path, output_format: str) -> None:
+        self.split = split
+        self.out_dir = out_dir
+        self.output_format = output_format
+        self.parquet_path = out_dir / split / "data.parquet"
+        self.arrow_path = out_dir / split / "data.arrow"
+        self._parquet_writer: pq.ParquetWriter | None = None
+        self._arrow_writer: ipc.RecordBatchFileWriter | None = None
+        self.rows = 0
+        self.duration_seconds = 0.0
+
+    def write(self, records: list[CanonicalRecord]) -> None:
+        if not records:
+            return
+        rows = [asdict(record) for record in records]
+        table = pa.Table.from_pylist(rows, schema=CANONICAL_ARROW_SCHEMA)
+        target_dir = self.out_dir / self.split
+        target_dir.mkdir(parents=True, exist_ok=True)
+        if self.output_format in {"parquet", "both"}:
+            if self._parquet_writer is None:
+                self._parquet_writer = pq.ParquetWriter(str(self.parquet_path), CANONICAL_ARROW_SCHEMA)
+            self._parquet_writer.write_table(table)
+        if self.output_format in {"arrow", "both"}:
+            if self._arrow_writer is None:
+                sink = pa.OSFile(str(self.arrow_path), "wb")
+                self._arrow_writer = ipc.new_file(sink, CANONICAL_ARROW_SCHEMA)
+            self._arrow_writer.write_table(table)
+        self.rows += len(records)
+        self.duration_seconds += sum(record.duration_seconds or 0.0 for record in records)
+
+    def close(self) -> MaterializedSplitSummary:
+        if self._parquet_writer is not None:
+            self._parquet_writer.close()
+        if self._arrow_writer is not None:
+            self._arrow_writer.close()
+        return MaterializedSplitSummary(
+            split=self.split,
+            rows=self.rows,
+            duration_seconds=self.duration_seconds,
+            parquet_path=str(self.parquet_path) if self.parquet_path.exists() else None,
+            arrow_path=str(self.arrow_path) if self.arrow_path.exists() else None,
+        )
+
+
+def write_materialization_manifest(
+    out_dir: str,
+    recipe: dict[str, object],
+    split_summaries: list[MaterializedSplitSummary],
+) -> str:
+    manifest_path = Path(out_dir) / "materialization_manifest.json"
+    payload = {
+        "manifest_type": "materialized_asr_dataset",
+        "canonical_schema": list(CANONICAL_COLUMNS),
+        "recipe": recipe,
+        "splits": [asdict(summary) for summary in split_summaries if summary.rows > 0],
+    }
+    manifest_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return str(manifest_path)
+
+
+def push_materialized_dataset(
+    materialized_dir: str,
+    repo_id: str,
+    private: bool,
+    token: str | None,
+    max_shard_size: str,
+    progress: ProgressReporter | None = None,
+) -> dict[str, object]:
+    progress = progress or NullProgressReporter()
+    manifest_path = Path(materialized_dir) / "materialization_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    split_files: dict[str, str] = {}
+    format_name = None
+    for split in manifest.get("splits", []):
+        if split.get("parquet_path"):
+            split_files[split["split"]] = split["parquet_path"]
+            format_name = "parquet"
+        elif split.get("arrow_path"):
+            split_files[split["split"]] = split["arrow_path"]
+            format_name = "arrow"
+    if not split_files or format_name is None:
+        raise FileNotFoundError(f"No materialized dataset files found under {materialized_dir}")
+
+    from datasets import load_dataset
+
+    progress.emit(f"Loading local {format_name} dataset files for push")
+    dataset_dict = load_dataset(format_name, data_files=split_files)
+    progress.emit(f"Pushing dataset to Hugging Face Hub: {repo_id}")
+    dataset_dict.push_to_hub(repo_id, private=private, token=token, max_shard_size=max_shard_size)
+    return {
+        "repo_id": repo_id,
+        "materialized_dir": materialized_dir,
+        "splits": sorted(split_files),
+        "private": private,
+    }

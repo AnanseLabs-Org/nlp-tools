@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import json
 
 import pytest
 
@@ -28,6 +29,14 @@ class FakeParquetReader:
         trimmed = rows[:limit] if limit is not None else rows
         projected = [{column: row.get(column) for column in columns} for row in trimmed]
         return FakeTable(projected)
+
+    def iter_batches(self, path: str, columns: list[str], batch_size: int = 1000):
+        self.calls.append({"path": path, "columns": list(columns), "batch_size": batch_size})
+        rows = self.rows_by_path[path]
+        for start in range(0, len(rows), batch_size):
+            batch = rows[start : start + batch_size]
+            projected = [{column: row.get(column) for column in columns} for row in batch]
+            yield path, projected
 
 
 class FakeMetadataClient:
@@ -97,3 +106,59 @@ def fake_service() -> RecipeService:
     service = RecipeService(metadata_client=FakeMetadataClient(metadata), reader=reader)
     service._fake_reader = reader
     return service
+
+
+@pytest.fixture
+def recipe_file(tmp_path) -> str:
+    path = tmp_path / "recipe.json"
+    path.write_text(
+        json.dumps(
+            {
+                "selected_datasets": [
+                    {
+                        "dataset_key": "waxal_aka_asr",
+                        "source_dataset": "fiifinketia/WaxalNLP",
+                        "source_subset": "aka_asr",
+                        "selected_splits": ["train"],
+                        "canonical_column_mapping": {},
+                        "upstream_split_counts": {"train": 2},
+                    },
+                    {
+                        "dataset_key": "ghana_english_2700hrs",
+                        "source_dataset": "fiifinketia/ghana-english-asr-2700hrs",
+                        "source_subset": "default",
+                        "selected_splits": ["train"],
+                        "canonical_column_mapping": {},
+                        "upstream_split_counts": {"train": 2},
+                    },
+                ],
+                "selected_analyses": ["text-frequency"],
+                "compatibility_notes": [],
+                "sample_policy": {"mode": "sample", "sample_size": 1000, "preview_rows": 5},
+                "split_strategy": {"policy": "train-val", "val_ratio": 0.1, "test_ratio": 0.0, "deterministic_key": "record_id"},
+                "audio_policy": {"decode_enabled": False, "download_enabled": False},
+                "filters": {"status": "not_started", "pipeline": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+@pytest.fixture
+def text_frequency_file(tmp_path) -> str:
+    path = tmp_path / "waxal_text_frequency.json"
+    path.write_text(
+        json.dumps(
+            {
+                "result": {
+                    "top_tokens": [
+                        ["hello", 10],
+                        ["world", 9],
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return str(path)

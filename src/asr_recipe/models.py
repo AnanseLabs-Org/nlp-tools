@@ -77,6 +77,15 @@ class SplitAssignment:
     record_id: str
 
 
+@dataclass(frozen=True)
+class MaterializedSplitSummary:
+    split: str
+    rows: int
+    duration_seconds: float
+    parquet_path: str | None = None
+    arrow_path: str | None = None
+
+
 @dataclass
 class RecipeManifest:
     selected_datasets: list[dict[str, object]]

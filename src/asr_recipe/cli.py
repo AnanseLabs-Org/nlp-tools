@@ -13,8 +13,9 @@ from asr_recipe.registry import DATASET_REGISTRY
 
 app = typer.Typer(
     help=(
-        "Inspect ASR datasets, run non-audio analyses, and export a recipe manifest for a downstream "
-        "Whisper notebook. Audio decode stays off unless a future audio-gated path is explicitly approved."
+        "Inspect ASR datasets, run non-audio analyses, export a recipe manifest, materialize a filtered "
+        "canonical dataset locally, and push the result to Hugging Face Hub. Audio decode stays off unless "
+        "a future audio-gated path is explicitly approved."
     )
 )
 
@@ -108,6 +109,62 @@ def export_recipe_command(
         test_ratio=test_ratio,
         out_path=str(out),
         include_unlabeled=include_unlabeled,
+    )
+    _print_json(payload)
+
+
+@app.command("materialize-dataset")
+def materialize_dataset_command(
+    recipe: Path = typer.Option(..., help="Path to an exported recipe JSON manifest."),
+    out_dir: Path = typer.Option(..., help="Directory to write the local materialized dataset."),
+    format: str = typer.Option("parquet", help="Output format: parquet, arrow, or both."),
+    batch_size: int = typer.Option(1000, min=1, help="Rows per parquet batch while materializing."),
+    top_tokens_file: list[str] = typer.Option(
+        [],
+        help="Attach text-frequency filters as DATASET_KEY=analysis.json. Can be provided multiple times.",
+    ),
+    top_k_tokens: int = typer.Option(500, min=1, help="How many top tokens to keep from each analysis file."),
+    min_overlap_ratio: float = typer.Option(0.5, min=0.0, max=1.0, help="Minimum token overlap ratio for text-frequency filters."),
+    min_text_tokens: int = typer.Option(1, min=1, help="Minimum transcript token count to keep."),
+    max_text_tokens: int | None = typer.Option(None, min=1, help="Optional maximum transcript token count to keep."),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Suppress progress output and only print JSON results."),
+) -> None:
+    """Read a recipe, normalize rows, apply filters, and write local Parquet or Arrow splits."""
+    allowed = {"parquet", "arrow", "both"}
+    if format not in allowed:
+        raise typer.BadParameter("format must be one of parquet, arrow, both")
+    service = _service(quiet)
+    payload = service.materialize_dataset(
+        recipe_path=str(recipe),
+        out_dir=str(out_dir),
+        output_format=format,
+        batch_size=batch_size,
+        top_tokens_files=top_tokens_file,
+        top_k_tokens=top_k_tokens,
+        min_overlap_ratio=min_overlap_ratio,
+        min_text_tokens=min_text_tokens,
+        max_text_tokens=max_text_tokens,
+    )
+    _print_json(payload)
+
+
+@app.command("push-dataset")
+def push_dataset_command(
+    materialized_dir: Path = typer.Option(..., help="Directory created by materialize-dataset."),
+    repo_id: str = typer.Option(..., help="Target Hugging Face dataset repo id, for example org/name."),
+    private: bool = typer.Option(False, help="Create or update the remote dataset as private."),
+    token: str | None = typer.Option(None, help="Optional Hugging Face token. Falls back to existing login."),
+    max_shard_size: str = typer.Option("5GB", help="Shard size passed to datasets.push_to_hub()."),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Suppress progress output and only print JSON results."),
+) -> None:
+    """Push a locally materialized dataset directory to Hugging Face Hub."""
+    service = _service(quiet)
+    payload = service.push_dataset(
+        materialized_dir=str(materialized_dir),
+        repo_id=repo_id,
+        private=private,
+        token=token,
+        max_shard_size=max_shard_size,
     )
     _print_json(payload)
 

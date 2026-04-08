@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from asr_recipe.models import CanonicalRecord, DatasetSpec, SamplePolicy, ShardRef, SourceMetadata
@@ -28,6 +29,16 @@ class DatasetAdapter:
     def available_splits(self) -> tuple[str, ...]:
         return tuple(self.metadata.splits)
 
+    def unique_shards(self, split: str) -> list[ShardRef]:
+        seen: set[str] = set()
+        unique: list[ShardRef] = []
+        for shard in self.metadata.shards:
+            if shard.split != split or shard.path in seen:
+                continue
+            unique.append(shard)
+            seen.add(shard.path)
+        return unique
+
     def default_export_splits(self, include_unlabeled: bool = False) -> tuple[str, ...]:
         allowed = []
         for split in self.available_splits():
@@ -39,7 +50,7 @@ class DatasetAdapter:
     def iter_canonical_records(self, split: str, sample_policy: SamplePolicy) -> list[CanonicalRecord]:
         remaining = sample_policy.sample_size
         records: list[CanonicalRecord] = []
-        shards = [shard for shard in self.metadata.shards if shard.split == split]
+        shards = self.unique_shards(split)
         for shard in shards:
             if remaining <= 0:
                 break
@@ -54,6 +65,23 @@ class DatasetAdapter:
                 if remaining <= 0:
                     break
         return records
+
+    def iter_canonical_record_batches(
+        self,
+        split: str,
+        batch_size: int = 1000,
+    ) -> Iterator[list[CanonicalRecord]]:
+        row_offsets: dict[str, int] = {}
+        for shard in self.unique_shards(split):
+            for source_path, rows in self.reader.iter_batches(shard.path, columns=self.required_source_columns(), batch_size=batch_size):
+                offset = row_offsets.get(source_path, 0)
+                batch: list[CanonicalRecord] = []
+                for row in rows:
+                    batch.append(self._to_canonical_record(split=split, shard_path=source_path, row=row, row_index=offset))
+                    offset += 1
+                row_offsets[source_path] = offset
+                if batch:
+                    yield batch
 
     def required_source_columns(self) -> list[str]:
         requested = {
@@ -93,16 +121,18 @@ class DatasetAdapter:
     def _to_canonical_record(
         self,
         split: str,
-        shard: ShardRef,
         row: dict[str, object],
         row_index: int,
+        shard: ShardRef | None = None,
+        shard_path: str | None = None,
     ) -> CanonicalRecord:
+        effective_shard_path = shard_path or (shard.path if shard else "")
         return CanonicalRecord(
             source_dataset=self.spec.dataset,
             source_subset=self.spec.config,
             source_split=split,
             dataset_key=self.spec.key,
-            record_id=self._resolve_record_id(row=row, shard=shard, row_index=row_index),
+            record_id=self._resolve_record_id(row=row, shard_path=effective_shard_path, row_index=row_index),
             speaker_id=self._optional_str(row.get(self.spec.speaker_id_column)) if self.spec.speaker_id_column else None,
             gender=self._optional_str(row.get(self.spec.gender_column)) if self.spec.gender_column else None,
             language=self._optional_str(row.get(self.spec.language_column))
@@ -112,12 +142,12 @@ class DatasetAdapter:
             duration_seconds=self._optional_float(row.get(self.spec.duration_column)) if self.spec.duration_column else None,
         )
 
-    def _resolve_record_id(self, row: dict[str, object], shard: ShardRef, row_index: int) -> str:
+    def _resolve_record_id(self, row: dict[str, object], shard_path: str, row_index: int) -> str:
         if self.spec.id_column:
             explicit_id = row.get(self.spec.id_column)
             if explicit_id is not None and str(explicit_id).strip():
                 return str(explicit_id)
-        seed = f"{self.spec.key}|{shard.path}|{row_index}"
+        seed = f"{self.spec.key}|{shard_path}|{row_index}"
         digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
         return f"derived:{digest}"
 

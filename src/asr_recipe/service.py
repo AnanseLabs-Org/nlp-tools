@@ -1,10 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from pathlib import Path
 
 from asr_recipe.adapters import DatasetAdapter
 from asr_recipe.analyses import ANALYSIS_REGISTRY
 from asr_recipe.hf import HfMetadataClient
+from asr_recipe.materialize import (
+    SplitWriter,
+    assign_split,
+    build_text_filter_configs,
+    index_filter_configs,
+    load_recipe,
+    parse_key_value_pairs,
+    push_materialized_dataset,
+    record_passes_filters,
+    write_materialization_manifest,
+)
 from asr_recipe.models import SamplePolicy
 from asr_recipe.parquet_reader import ParquetReader, PyArrowParquetReader
 from asr_recipe.progress import NullProgressReporter, ProgressReporter
@@ -98,6 +110,81 @@ class RecipeService:
         write_recipe_manifest(out_path, manifest)
         self.progress.emit(f"Wrote recipe manifest: {out_path}")
         return {"out": out_path, "split_policy": resolved_policy, "dataset_keys": dataset_keys}
+
+    def materialize_dataset(
+        self,
+        recipe_path: str,
+        out_dir: str,
+        output_format: str,
+        batch_size: int,
+        top_tokens_files: list[str],
+        top_k_tokens: int,
+        min_overlap_ratio: float,
+        min_text_tokens: int,
+        max_text_tokens: int | None,
+    ) -> dict[str, object]:
+        self.progress.emit(f"Loading recipe: {recipe_path}")
+        recipe = load_recipe(recipe_path)
+        if top_tokens_files:
+            self.progress.emit("Configuring text-frequency filters")
+            top_token_map = parse_key_value_pairs(top_tokens_files, cast=str)
+            build_text_filter_configs(
+                recipe=recipe,
+                top_tokens_files=top_token_map,
+                top_k_tokens=top_k_tokens,
+                min_overlap_ratio=min_overlap_ratio,
+                min_text_tokens=min_text_tokens,
+                max_text_tokens=max_text_tokens,
+            )
+        filter_configs = index_filter_configs(recipe)
+        out_path = Path(out_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        writers: dict[str, SplitWriter] = {}
+
+        for dataset_entry in recipe.get("selected_datasets", []):
+            dataset_key = dataset_entry["dataset_key"]
+            selected_splits = dataset_entry["selected_splits"]
+            self.progress.emit(f"Materializing dataset: {dataset_key}")
+            adapter = self._adapter_for(dataset_key)
+            filter_config = filter_configs.get(dataset_key)
+            for source_split in selected_splits:
+                self.progress.emit(f"Scanning source split: {dataset_key}/{source_split}")
+                for batch in adapter.iter_canonical_record_batches(source_split, batch_size=batch_size):
+                    grouped: dict[str, list] = {}
+                    for record in batch:
+                        if not record_passes_filters(record, filter_config):
+                            continue
+                        target_split = assign_split(record, recipe["split_strategy"])
+                        grouped.setdefault(target_split, []).append(record)
+                    for target_split, records in grouped.items():
+                        writer = writers.setdefault(target_split, SplitWriter(target_split, out_path, output_format))
+                        writer.write(records)
+
+        split_summaries = [writers[split].close() for split in sorted(writers)]
+        manifest_path = write_materialization_manifest(out_dir, recipe, split_summaries)
+        self.progress.emit(f"Wrote materialized dataset: {manifest_path}")
+        return {
+            "out_dir": out_dir,
+            "manifest_path": manifest_path,
+            "splits": [asdict(summary) for summary in split_summaries if summary.rows > 0],
+        }
+
+    def push_dataset(
+        self,
+        materialized_dir: str,
+        repo_id: str,
+        private: bool,
+        token: str | None,
+        max_shard_size: str,
+    ) -> dict[str, object]:
+        return push_materialized_dataset(
+            materialized_dir=materialized_dir,
+            repo_id=repo_id,
+            private=private,
+            token=token,
+            max_shard_size=max_shard_size,
+            progress=self.progress,
+        )
 
     def _adapter_for(self, dataset_key: str) -> DatasetAdapter:
         spec = get_dataset_spec(dataset_key)
